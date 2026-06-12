@@ -141,14 +141,51 @@ class NodeSqliteAdapter implements SqliteDatabase {
  * report it per-instance — MCP can open multiple project DBs in one process, so
  * a process-global would race.
  */
-export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
+export function isPostgresBackendSelected(): boolean {
   const requested = (process.env.CODEGRAPH_DB_BACKEND ?? '').trim().toLowerCase();
-  if (requested === 'postgres' || requested === 'pg' || requested === 'postgresql') {
+  return requested === 'postgres' || requested === 'pg' || requested === 'postgresql';
+}
+
+/**
+ * Detect the JSON presence marker `createPgDatabase` leaves at the SQLite db
+ * path. Opening it with node:sqlite would fail with an opaque SQLITE_NOTADB
+ * ("file is not a database"); this lets us explain the backend mismatch
+ * instead.
+ */
+function isPgMarkerFile(dbPath: string): boolean {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require('fs') as typeof import('fs');
+    if (!fs.existsSync(dbPath)) return false;
+    const fd = fs.openSync(dbPath, 'r');
+    try {
+      const buf = Buffer.alloc(512);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      const head = buf.toString('utf8', 0, n);
+      return head.trimStart().startsWith('{') && /"backend"\s*:\s*"postgres"/.test(head);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
+  if (isPostgresBackendSelected()) {
     // Lazily required so the `pg` dependency and worker are only loaded when
     // the PostgreSQL backend is actually selected.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { createPgDatabase } = require('./pg-adapter');
     return { db: createPgDatabase(dbPath), backend: 'postgres' };
+  }
+
+  if (isPgMarkerFile(dbPath)) {
+    throw new Error(
+      'This project was indexed with the PostgreSQL backend, but CODEGRAPH_DB_BACKEND is not set. ' +
+        'Set CODEGRAPH_DB_BACKEND=postgres (plus CODEGRAPH_PG_URL / DATABASE_URL) to use that data, ' +
+        'or delete the .codegraph/ directory and re-run `codegraph init` to switch back to SQLite.'
+    );
   }
 
   try {

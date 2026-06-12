@@ -45,19 +45,32 @@ describe('pg-translate: INSERT OR REPLACE / IGNORE', () => {
     expect(t.text).not.toContain('id = EXCLUDED.id');
   });
 
-  it('maps INSERT OR IGNORE with a known key to DO NOTHING', () => {
+  it('replicates SQLite REPLACE delete-cascade for nodes: dependent edges/refs are purged via CTEs', () => {
+    // SQLite REPLACE = delete-then-insert; with foreign_keys=ON that CASCADEs
+    // away the replaced node's edges and unresolved_refs. The PG upsert must
+    // do the same or stale edges accumulate across re-upserts.
+    const t = translateSql('INSERT OR REPLACE INTO nodes (id, name, kind) VALUES (@id, @name, @kind)');
+    expect(t.text).toMatch(/^WITH _cg_replaced_edges AS \(DELETE FROM edges WHERE source = \$1 OR target = \$1\)/);
+    expect(t.text).toContain('DELETE FROM unresolved_refs WHERE from_node_id = $1');
+    // The CTE reuses the same @id binding, so `id` stays the first named param.
+    expect(t.named?.[0]).toBe('id');
+  });
+
+  it('maps INSERT OR IGNORE to DO NOTHING', () => {
     const t = translateSql(
       'INSERT OR IGNORE INTO schema_versions (version, applied_at, description) VALUES (?, ?, ?)'
     );
-    expect(t.text).toContain('ON CONFLICT (version) DO NOTHING');
+    expect(t.text).toContain('ON CONFLICT DO NOTHING');
   });
 
-  it('maps INSERT OR IGNORE on edges to a plain INSERT (no unique key)', () => {
+  it('maps INSERT OR IGNORE on edges to targetless ON CONFLICT DO NOTHING', () => {
+    // SQLite's OR IGNORE swallows ANY uniqueness violation; the targetless PG
+    // form matches every unique constraint (including ones added later).
     const t = translateSql(
       'INSERT OR IGNORE INTO edges (source, target, kind) VALUES (@source, @target, @kind)'
     );
     expect(t.text).toContain('INSERT INTO edges');
-    expect(t.text).not.toContain('ON CONFLICT');
+    expect(t.text).toMatch(/ON CONFLICT DO NOTHING$/);
   });
 });
 
@@ -130,8 +143,69 @@ describe('pg-translate: FTS5 consistency', () => {
     expect(fts5ToTsquery('"getUserById"*')).toBe('getUserById:*');
   });
 
+  it('keeps dotted/hyphenated identifiers matchable (both whole-lexeme and split forms)', () => {
+    // 'simple'-config tsvectors may hold 'App.tsx' as one lexeme (the default
+    // parser's file/host token types) OR split; FTS5 always split and matched.
+    // Gluing the pieces together ('Apptsx:*') would match NOTHING on PG.
+    expect(fts5ToTsquery('"App.tsx"*')).toBe("('App.tsx':* | (App & tsx:*))");
+    expect(fts5ToTsquery('"utils.parseConfig"* OR "auth"*')).toBe(
+      "('utils.parseConfig':* | (utils & parseConfig:*)) | auth:*"
+    );
+  });
+
   it('returns a never-match sentinel for an empty FTS query', () => {
     expect(fts5ToTsquery('')).toBe('codegraph_no_match_sentinel');
+  });
+
+  it('throws loudly when the FTS query shape drifts from what the rewriter recognizes', () => {
+    // Without this, drifted SQL would reach PG raw, error, get swallowed by
+    // searchNodesFTS's catch, and PG search would silently return [] forever.
+    expect(() =>
+      translateSql('SELECT id, bm25(nodes_fts) AS rank FROM nodes_fts WHERE nodes_fts MATCH ?')
+    ).toThrow(/FTS query shape not recognized/);
+  });
+});
+
+describe('pg-schema invariants', () => {
+  it('seeds the schema version from migrations.ts (cannot drift)', async () => {
+    const { SEEDED_SCHEMA_VERSION, PG_SCHEMA } = await import('../src/db/pg-schema');
+    const { CURRENT_SCHEMA_VERSION } = await import('../src/db/migrations');
+    expect(SEEDED_SCHEMA_VERSION).toBe(CURRENT_SCHEMA_VERSION);
+    expect(PG_SCHEMA).toContain(`VALUES (${CURRENT_SCHEMA_VERSION},`);
+  });
+
+  it('stores files.modified_at as DOUBLE PRECISION (mtimeMs is a fractional float)', async () => {
+    // fs.Stats.mtimeMs is fractional on ns-precision filesystems; a BIGINT
+    // column would reject it ('invalid input syntax for type bigint') and
+    // break every file upsert.
+    const { PG_SCHEMA } = await import('../src/db/pg-schema');
+    expect(PG_SCHEMA).toMatch(/modified_at DOUBLE PRECISION NOT NULL/);
+  });
+});
+
+describe('per-project PG schema naming', () => {
+  it('derives a stable identifier from the db path and honors a recorded marker schema', async () => {
+    const { derivePgSchemaName } = await import('../src/db/pg-adapter');
+    const a = derivePgSchemaName('/proj/a/.codegraph/codegraph.db');
+    const b = derivePgSchemaName('/proj/b/.codegraph/codegraph.db');
+    expect(a).toMatch(/^codegraph_[0-9a-f]{16}$/);
+    expect(a).not.toBe(b); // two projects must never share tables
+    expect(derivePgSchemaName('/proj/a/.codegraph/codegraph.db')).toBe(a); // stable
+    // A schema recorded in an existing marker wins over path derivation, so a
+    // moved project keeps finding its data.
+    expect(derivePgSchemaName('/proj/moved/.codegraph/codegraph.db', a)).toBe(a);
+  });
+
+  it('rejects a CODEGRAPH_PG_SCHEMA override that is not a plain identifier', async () => {
+    const { derivePgSchemaName } = await import('../src/db/pg-adapter');
+    const prev = process.env.CODEGRAPH_PG_SCHEMA;
+    process.env.CODEGRAPH_PG_SCHEMA = 'bad-name; DROP SCHEMA public';
+    try {
+      expect(() => derivePgSchemaName('/x/.codegraph/codegraph.db')).toThrow(/identifier/);
+    } finally {
+      if (prev !== undefined) process.env.CODEGRAPH_PG_SCHEMA = prev;
+      else delete process.env.CODEGRAPH_PG_SCHEMA;
+    }
   });
 });
 
@@ -144,6 +218,26 @@ describe('createDatabase backend dispatch', () => {
       const { db, backend } = createDatabase(path.join(dir, 'x.db'));
       expect(backend).toBe('node-sqlite');
       db.close();
+    } finally {
+      if (prev !== undefined) process.env.CODEGRAPH_DB_BACKEND = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('explains the backend mismatch when SQLite is pointed at a PG presence marker', () => {
+    // A project indexed with CODEGRAPH_DB_BACKEND=postgres leaves a JSON
+    // marker at the SQLite db path. Opening it without the env var must say
+    // what happened — not fail with an opaque SQLITE_NOTADB.
+    const prev = process.env.CODEGRAPH_DB_BACKEND;
+    delete process.env.CODEGRAPH_DB_BACKEND;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pg-marker-'));
+    const dbPath = path.join(dir, 'codegraph.db');
+    fs.writeFileSync(
+      dbPath,
+      JSON.stringify({ backend: 'postgres', schema: 'codegraph_abc', note: 'marker' }, null, 2)
+    );
+    try {
+      expect(() => createDatabase(dbPath)).toThrow(/PostgreSQL backend.*CODEGRAPH_DB_BACKEND/s);
     } finally {
       if (prev !== undefined) process.env.CODEGRAPH_DB_BACKEND = prev;
       fs.rmSync(dir, { recursive: true, force: true });

@@ -69,11 +69,33 @@ const TS_RANK_WEIGHTS = `'{0.05,0.1,0.25,1.0}'`;
 export function fts5ToTsquery(fts5: string): string {
   const terms = fts5
     .split(/\s+OR\s+/i)
-    .map((t) => t.replace(/["*]/g, '').replace(/[^\w]/g, '').trim())
-    .filter((t) => t.length > 0)
-    .map((t) => `${t}:*`);
-  if (terms.length === 0) return 'codegraph_no_match_sentinel';
-  return terms.join(' | ');
+    .map((t) => t.replace(/["*]/g, '').trim())
+    .filter((t) => t.length > 0);
+
+  const parts: string[] = [];
+  for (const term of terms) {
+    const pieces = term.split(/[^\w]+/).filter((p) => p.length > 0);
+    if (pieces.length === 0) continue;
+    if (pieces.length === 1) {
+      parts.push(`${pieces[0]}:*`);
+      continue;
+    }
+    // Dotted/hyphenated identifiers ('App.tsx', 'utils.parseConfig'): the
+    // 'simple'-config tsvector may hold them either as ONE lexeme (the default
+    // parser's host/file token types keep 'app.tsx' whole) or as SPLIT lexemes
+    // ('utils', 'parseconfig'). FTS5's tokenizer always splits, so the quoted
+    // FTS5 term matched. Emit BOTH forms OR-ed so either indexing outcome
+    // matches; mirror FTS5's phrase-prefix by prefixing only the last piece.
+    const whole = term.replace(/[^\w.\-/@]/g, '');
+    const split = pieces.map((p, i) => (i === pieces.length - 1 ? `${p}:*` : p)).join(' & ');
+    if (whole.length > 0 && /[^\w]/.test(whole)) {
+      parts.push(`('${whole}':* | (${split}))`);
+    } else {
+      parts.push(`(${split})`);
+    }
+  }
+  if (parts.length === 0) return 'codegraph_no_match_sentinel';
+  return parts.join(' | ');
 }
 
 /** Rewrite the single FTS5 bm25/MATCH query to the consistent PG ts_rank form. */
@@ -87,6 +109,16 @@ function rewriteFts(sql: string): string {
       `FROM nodes, _ftsq ` +
       `WHERE nodes.tsv @@ _ftsq.q`
   );
+  // Fail LOUDLY if the queries.ts FTS query drifted away from the shape the
+  // regex above matches. Without this, the raw SQLite SQL ("FROM nodes_fts …
+  // MATCH ?") would reach PostgreSQL, error there, and be swallowed by
+  // searchNodesFTS's catch — PG search would silently return [] forever.
+  if (/nodes_fts/i.test(replaced)) {
+    throw new Error(
+      '[codegraph] FTS query shape not recognized by the PostgreSQL translator — ' +
+        'update rewriteFts in src/db/pg-translate.ts to match the query in queries.ts'
+    );
+  }
   // bm25 ranks ascending (more-negative = better); ts_rank ranks descending.
   return replaced.replace(/ORDER\s+BY\s+score\b(?!\s+DESC)/i, 'ORDER BY score DESC');
 }
@@ -110,11 +142,26 @@ function rewriteInsertOrAction(sql: string): string {
       .map((c) => `${c} = EXCLUDED.${c}`)
       .join(', ');
     out += ` ON CONFLICT (${key}) DO UPDATE SET ${setList}`;
+    // SQLite's REPLACE is delete-then-insert: with foreign_keys=ON the delete
+    // CASCADEs, purging the replaced node's edges and unresolved_refs before
+    // the fresh row lands. PG's DO UPDATE keeps the row, so those dependents
+    // would survive and accumulate across re-upserts (e.g. framework route
+    // nodes re-emitted every resolution pass). Replicate the cascade with
+    // data-modifying CTEs on the dependent tables (NOT on nodes itself, so the
+    // upsert still sees the existing row). Uses the same @id placeholder the
+    // statement already binds, so it only applies to the @named form.
+    if (table === 'nodes' && /@id\b/.test(sql)) {
+      out =
+        `WITH _cg_replaced_edges AS (DELETE FROM edges WHERE source = @id OR target = @id), ` +
+        `_cg_replaced_refs AS (DELETE FROM unresolved_refs WHERE from_node_id = @id) ` +
+        out;
+    }
   } else {
-    // IGNORE: only express a conflict target when we have a real unique key.
-    // `edges` has no unique (source,target,kind) constraint — its callers
-    // pre-validate FK endpoints — so it stays a plain INSERT.
-    if (key) out += ` ON CONFLICT (${key}) DO NOTHING`;
+    // IGNORE: SQLite's OR IGNORE swallows ANY uniqueness violation, so use the
+    // targetless form — it matches every unique constraint, including ones a
+    // table doesn't have yet (a plain INSERT would start throwing duplicate-key
+    // the day a constraint is added, and only on the PG backend).
+    out += ` ON CONFLICT DO NOTHING`;
   }
   return out;
 }
@@ -184,9 +231,27 @@ function convertPlaceholders(sql: string): { text: string; named: string[] | nul
 }
 
 /**
+ * Memo cache for {@link translateSql}. The statement corpus is small and
+ * mostly static (QueryBuilder re-prepares dynamic IN-clause queries per call),
+ * so caching makes repeat prepares O(1) instead of a multi-pass regex rewrite.
+ * Bounded defensively; entries are immutable so sharing is safe.
+ */
+const translateCache = new Map<string, TranslatedSql>();
+const TRANSLATE_CACHE_MAX = 500;
+
+/**
  * Translate one SQLite statement to PostgreSQL.
  */
 export function translateSql(sqlInput: string): TranslatedSql {
+  const cached = translateCache.get(sqlInput);
+  if (cached) return cached;
+  const result = translateSqlUncached(sqlInput);
+  if (translateCache.size >= TRANSLATE_CACHE_MAX) translateCache.clear();
+  translateCache.set(sqlInput, result);
+  return result;
+}
+
+function translateSqlUncached(sqlInput: string): TranslatedSql {
   const sql = sqlInput.trim();
 
   // PRAGMA and the SQLite bootstrap schema (FTS5 virtual table) are no-ops:
