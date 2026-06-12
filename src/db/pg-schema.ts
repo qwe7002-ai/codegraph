@@ -20,13 +20,17 @@
  *     ranks with `ts_rank('{0.05,0.1,0.25,1.0}', ...)` — the 1:2:5:20 ratio
  *     normalized to D,C,B,A — so name matches dominate exactly as under bm25.
  *
- * IMPORTANT: keep `SEEDED_SCHEMA_VERSION` in sync with
- * `CURRENT_SCHEMA_VERSION` in `migrations.ts`. The worker seeds
- * `schema_versions` with this value so `getCurrentVersion()` reports the
- * latest version and the SQLite migration runner finds nothing pending.
+ * `SEEDED_SCHEMA_VERSION` is imported from `migrations.ts` (single source of
+ * truth — it can't drift). The worker seeds `schema_versions` with this value
+ * so `getCurrentVersion()` reports the latest version and the SQLite migration
+ * runner finds nothing pending. NOTE: when bumping `CURRENT_SCHEMA_VERSION`,
+ * fold the new migration's DDL into `PG_SCHEMA` below — the version seed makes
+ * the runner skip it, so the PG schema must already include it.
  */
 
-export const SEEDED_SCHEMA_VERSION = 5;
+import { CURRENT_SCHEMA_VERSION } from './migrations';
+
+export const SEEDED_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 
 export const PG_SCHEMA = `
 -- Schema version tracking
@@ -83,7 +87,13 @@ CREATE TABLE IF NOT EXISTS files (
     content_hash TEXT NOT NULL,
     language TEXT NOT NULL,
     size BIGINT NOT NULL,
-    modified_at BIGINT NOT NULL,
+    -- DOUBLE PRECISION, not BIGINT: callers bind fs.Stats.mtimeMs, which is a
+    -- FRACTIONAL millisecond float on ns-precision filesystems. SQLite's type
+    -- affinity stores the float silently; PG's int8 input parser would reject
+    -- it ('invalid input syntax for type bigint: "...123.456"') and break
+    -- every file upsert. float8 carries the same 53-bit precision as the JS
+    -- number, and the staleness check compares Math.floor()ed values.
+    modified_at DOUBLE PRECISION NOT NULL,
     indexed_at BIGINT NOT NULL,
     node_count INTEGER DEFAULT 0,
     errors TEXT

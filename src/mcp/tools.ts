@@ -3116,16 +3116,24 @@ export class ToolHandler {
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,
     );
 
-    // Surface the active SQLite backend (node:sqlite, Node's built-in real
-    // SQLite — full WAL + FTS5, no native build).
-    lines.push(`**Backend:** node:sqlite (Node built-in) — full WAL + FTS5`);
+    // Surface the active backend: node:sqlite (Node's built-in real SQLite —
+    // full WAL + FTS5, no native build) or the opt-in PostgreSQL backend.
+    const backend = cg.getBackend();
+    if (backend === 'postgres') {
+      lines.push(`**Backend:** postgres — external PostgreSQL server (opt-in via CODEGRAPH_DB_BACKEND)`);
+    } else {
+      lines.push(`**Backend:** node:sqlite (Node built-in) — full WAL + FTS5`);
+    }
 
     // Effective journal mode. 'wal' ⇒ concurrent reads never block on a writer;
     // anything else ⇒ they can ("database is locked"). node:sqlite supports WAL
     // everywhere, so a non-wal mode means the filesystem can't (network/
-    // virtualized mounts, WSL2 /mnt). See issue #238.
+    // virtualized mounts, WSL2 /mnt). See issue #238. PostgreSQL has no journal
+    // mode — MVCC always gives non-blocking reads — so skip the WAL warning.
     const journalMode = cg.getJournalMode();
-    if (journalMode === 'wal') {
+    if (backend === 'postgres') {
+      lines.push(`**Journal mode:** n/a (PostgreSQL MVCC — concurrent reads safe)`);
+    } else if (journalMode === 'wal') {
       lines.push(`**Journal mode:** wal (concurrent reads safe)`);
     } else {
       lines.push(

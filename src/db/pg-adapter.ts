@@ -14,18 +14,26 @@
  * because it reads the port queue directly. (Node permits `Atomics.wait` on the
  * main thread, unlike browsers — this is the basis of the bridge.)
  *
+ * Every request carries a correlation `id` that the worker echoes back. The
+ * drain loop discards any response whose id doesn't match the in-flight call,
+ * so a response arriving after its call timed out can never be delivered as a
+ * later call's answer (which would silently desync every subsequent result).
+ *
  * NOTE: blocking the main thread is the cost of preserving the synchronous
  * call contract without rewriting every query site. The MCP server and file
  * watcher share this thread, so their event loops are paused for the duration
  * of each query. This backend is therefore opt-in (see `createDatabase`).
  *
  * Caveats vs. SQLite:
- *   - `iterate()` materializes the full result set (no server-side cursor over
- *     the sync bridge), so it loses the O(1)-memory property of the SQLite path.
+ *   - `iterate()` is chunked, not row-streamed: the worker materializes the
+ *     full result set once and ships it to the main thread in fixed-size
+ *     chunks, so main-thread memory stays O(chunk) but worker memory is
+ *     O(rows) until the iterator is consumed or closed.
  *   - `pragma()` is a no-op (PG has no PRAGMAs); `journal_mode` reports
  *     `'postgres'` so `codegraph status` stays informative.
  */
 
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -40,9 +48,20 @@ import { translateSql, fts5ToTsquery, TranslatedSql } from './pg-translate';
 /** Per-call timeout (ms). Generous headroom for schema apply / large scans. */
 const CALL_TIMEOUT_MS = 120_000;
 
+/**
+ * Upper bound for one Atomics.wait slice. Waiting in slices (instead of one
+ * long wait) lets the drain loop re-poll the port, which covers the rare case
+ * where the worker's notify lands while we're between drain and re-arm —
+ * without the pathological busy-spin a pure polling loop would be.
+ */
+const WAIT_SLICE_MS = 100;
+
 interface WorkerResponse {
+  id?: number;
   rows?: any[];
   rowCount?: number;
+  /** Cursor handle for chunked iterate(); present when more chunks remain. */
+  cursor?: number;
   ok?: boolean;
   error?: string;
   code?: string;
@@ -60,21 +79,41 @@ class PgDatabaseAdapter implements SqliteDatabase {
   private _closed = false;
   private txDepth = 0;
   private fatalError: Error | null = null;
+  private seq = 0;
 
-  constructor(connectionString: string) {
+  constructor(connectionString: string, schemaName: string) {
+    // Fail fast (and clearly) when the compiled worker isn't on disk — e.g.
+    // running the TS sources via tsx/vitest, where __dirname holds only
+    // pg-worker.ts. Without this check the Worker constructor fails async and
+    // the first query would park the main thread for the full call timeout.
+    const workerPath = path.join(__dirname, 'pg-worker.js');
+    if (!fs.existsSync(workerPath)) {
+      throw new Error(
+        `PostgreSQL backend worker not found at ${workerPath} — the PG backend requires ` +
+          'the compiled build (npm run build); it cannot run from TypeScript sources.'
+      );
+    }
+
     const { port1, port2 } = new MessageChannel();
     this.mainPort = port1;
     const signal = new SharedArrayBuffer(4);
     this.lock = new Int32Array(signal);
 
-    this.worker = new Worker(path.join(__dirname, 'pg-worker.js'), {
-      workerData: { port: port2, signal, connectionString },
+    this.worker = new Worker(workerPath, {
+      workerData: { port: port2, signal, connectionString, schemaName },
       transferList: [port2],
     });
-    // Surface worker crashes; the flag is observed after a blocking call's
-    // timeout (the handler can't run while the main thread is parked).
+    // Surface worker crashes. These handlers can only run while the main
+    // thread is NOT parked in Atomics.wait (event loop callbacks), so they
+    // primarily make the NEXT call fail fast; a crash during a call is
+    // reported by the worker's own uncaughtException responder.
     this.worker.on('error', (err) => {
       this.fatalError = err instanceof Error ? err : new Error(String(err));
+    });
+    this.worker.on('exit', (code) => {
+      if (!this._closed && this.fatalError === null) {
+        this.fatalError = new Error(`PostgreSQL worker exited unexpectedly (code ${code})`);
+      }
     });
     // Keep the process from being held open by the worker once we're done.
     this.worker.unref();
@@ -85,35 +124,55 @@ class PgDatabaseAdapter implements SqliteDatabase {
   }
 
   /** Block the main thread until the worker answers the posted request. */
-  private call(req: { op: 'query' | 'exec' | 'close'; sql?: string; params?: unknown[] }): WorkerResponse {
+  private call(req: {
+    op: 'query' | 'exec' | 'fetch' | 'release' | 'close';
+    sql?: string;
+    params?: unknown[];
+    chunk?: boolean;
+    cursor?: number;
+  }): WorkerResponse {
     if (this._closed) throw new Error('PostgreSQL connection is closed');
     if (this.fatalError) throw this.fatalError;
 
+    const id = ++this.seq;
     Atomics.store(this.lock, 0, 0);
-    this.mainPort.postMessage(req);
+    this.mainPort.postMessage({ ...req, id });
 
-    const waitResult = Atomics.wait(this.lock, 0, 0, CALL_TIMEOUT_MS);
-    if (waitResult === 'timed-out') {
-      throw this.fatalError ?? new Error('PostgreSQL worker timed out (or crashed)');
+    const deadline = Date.now() + CALL_TIMEOUT_MS;
+    for (;;) {
+      // Drain everything queued. Stale responses (a call that timed out
+      // earlier finally answered) are discarded by the id check.
+      let msg = receiveMessageOnPort(this.mainPort);
+      while (msg !== undefined) {
+        const resp = msg.message as WorkerResponse;
+        if (resp.id === id) return this.unwrap(resp);
+        msg = receiveMessageOnPort(this.mainPort);
+      }
+
+      if (this.fatalError) throw this.fatalError;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `PostgreSQL worker did not answer within ${CALL_TIMEOUT_MS}ms (slow query or crashed worker)`
+        );
+      }
+
+      // Re-arm and wait. The wait is sliced so a notify that fired between the
+      // drain above and this store is recovered on the next drain pass at most
+      // WAIT_SLICE_MS later (the message itself is read via the port queue, so
+      // nothing is lost — only the wakeup can race).
+      Atomics.store(this.lock, 0, 0);
+      Atomics.wait(this.lock, 0, 0, Math.min(remaining, WAIT_SLICE_MS));
     }
+  }
 
-    // Drain the response. Defensive spin: in rare cases the notify can win the
-    // race against cross-thread message delivery.
-    let msg = receiveMessageOnPort(this.mainPort);
-    let spins = 0;
-    while (!msg && spins < 5_000_000) {
-      msg = receiveMessageOnPort(this.mainPort);
-      spins++;
-    }
-    if (!msg) throw new Error('PostgreSQL worker sent no response');
-
-    const result = msg.message as WorkerResponse;
-    if (result.error) {
-      const err = new Error(result.error);
-      (err as { code?: string }).code = result.code;
+  private unwrap(resp: WorkerResponse): WorkerResponse {
+    if (resp.error) {
+      const err = new Error(resp.error);
+      (err as { code?: string }).code = resp.code;
       throw err;
     }
-    return result;
+    return resp;
   }
 
   /** Build the positional `$n` param array from a translated statement. */
@@ -125,15 +184,15 @@ class PgDatabaseAdapter implements SqliteDatabase {
     } else {
       params = rawArgs.map(normalizeParam);
     }
-    if (t.ftsParamIndex !== null && t.ftsParamIndex < params.length) {
+    if (t.ftsParamIndex !== null) {
       params[t.ftsParamIndex] = fts5ToTsquery(String(params[t.ftsParamIndex] ?? ''));
     }
     return params;
   }
 
-  private runTranslated(t: TranslatedSql, rawArgs: unknown[]): WorkerResponse {
+  private runTranslated(t: TranslatedSql, rawArgs: unknown[], chunk = false): WorkerResponse {
     if (t.isNoop) return { rows: [], rowCount: 0 };
-    return this.call({ op: 'query', sql: t.text, params: this.bindParams(t, rawArgs) });
+    return this.call({ op: 'query', sql: t.text, params: this.bindParams(t, rawArgs), chunk });
   }
 
   prepare(sql: string): SqliteStatement {
@@ -153,8 +212,45 @@ class PgDatabaseAdapter implements SqliteDatabase {
         return r.rows ?? [];
       },
       iterate(...params: any[]) {
-        const r = self.runTranslated(t, params);
-        return (r.rows ?? [])[Symbol.iterator]();
+        // Chunked pull: the worker buffers the full result set once and ships
+        // CURSOR_CHUNK_ROWS-sized slices on demand, so main-thread memory is
+        // O(chunk) instead of O(rows) — preserving what callers like
+        // iterateNodesByKind rely on (#610). `return()` releases the worker
+        // buffer when a for..of exits early.
+        const first = self.runTranslated(t, params, true);
+        let buf = first.rows ?? [];
+        let cursor = first.cursor;
+        let idx = 0;
+        const iterator: IterableIterator<any> = {
+          [Symbol.iterator]() {
+            return this;
+          },
+          next(): IteratorResult<any> {
+            if (idx < buf.length) return { value: buf[idx++], done: false };
+            while (cursor !== undefined) {
+              const r = self.call({ op: 'fetch', cursor });
+              buf = r.rows ?? [];
+              idx = 0;
+              cursor = r.cursor;
+              if (idx < buf.length) return { value: buf[idx++], done: false };
+            }
+            return { value: undefined, done: true };
+          },
+          return(value?: any): IteratorResult<any> {
+            if (cursor !== undefined) {
+              try {
+                self.call({ op: 'release', cursor });
+              } catch {
+                /* releasing is best-effort */
+              }
+              cursor = undefined;
+            }
+            buf = [];
+            idx = 0;
+            return { value, done: true };
+          },
+        };
+        return iterator;
       },
     };
   }
@@ -208,6 +304,11 @@ class PgDatabaseAdapter implements SqliteDatabase {
     }
     this._closed = true;
     try {
+      this.mainPort.close();
+    } catch {
+      /* ignore */
+    }
+    try {
       void this.worker.terminate();
     } catch {
       /* ignore */
@@ -225,28 +326,74 @@ export function resolvePgConnectionString(): string {
   return process.env.CODEGRAPH_PG_URL ?? process.env.DATABASE_URL ?? '';
 }
 
+const PG_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Per-project PG schema name. One PostgreSQL database typically serves many
+ * projects (DATABASE_URL is user/machine-global), so each project's tables
+ * live in their own schema — otherwise two indexed repos would interleave
+ * rows in shared tables and one project's clear()/sync would destroy the
+ * other's graph. Precedence:
+ *   1. `CODEGRAPH_PG_SCHEMA` (explicit override; must be a plain identifier),
+ *   2. the schema recorded in an existing marker file (stable across moves),
+ *   3. derived from the resolved dbPath (stable per project location).
+ */
+export function derivePgSchemaName(dbPath: string, markerSchema?: string): string {
+  const explicit = (process.env.CODEGRAPH_PG_SCHEMA ?? '').trim();
+  if (explicit) {
+    if (!PG_IDENT.test(explicit) || explicit.length > 63) {
+      throw new Error(
+        `CODEGRAPH_PG_SCHEMA must be a plain PostgreSQL identifier (got '${explicit}')`
+      );
+    }
+    return explicit;
+  }
+  if (markerSchema && PG_IDENT.test(markerSchema) && markerSchema.length <= 63) {
+    return markerSchema;
+  }
+  const hash = crypto.createHash('sha256').update(path.resolve(dbPath)).digest('hex').slice(0, 16);
+  return `codegraph_${hash}`;
+}
+
 /**
  * Create a PostgreSQL-backed database that satisfies the `SqliteDatabase`
  * interface. `dbPath` is the path CodeGraph would have used for the SQLite
  * file; we write a small presence marker there so the lifecycle checks in
- * `DatabaseConnection` (`fs.existsSync` on open, `fs.statSync` for size) keep
- * working unchanged — the real data lives in PostgreSQL.
+ * `DatabaseConnection` (`fs.existsSync` on open) keep working unchanged — the
+ * real data lives in PostgreSQL, in the per-project schema recorded in the
+ * marker. An existing marker's schema name is reused so the project keeps
+ * finding its data even if the directory is moved.
  */
 export function createPgDatabase(dbPath: string): SqliteDatabase {
   const dir = path.dirname(dbPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  if (!fs.existsSync(dbPath)) {
+
+  let markerSchema: string | undefined;
+  if (fs.existsSync(dbPath)) {
+    try {
+      const marker = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+      if (marker && marker.backend === 'postgres' && typeof marker.schema === 'string') {
+        markerSchema = marker.schema;
+      }
+    } catch {
+      /* unreadable marker → derive from path below */
+    }
+  }
+  const schemaName = derivePgSchemaName(dbPath, markerSchema);
+
+  if (markerSchema !== schemaName || !fs.existsSync(dbPath)) {
     fs.writeFileSync(
       dbPath,
       JSON.stringify(
         {
           backend: 'postgres',
-          note: 'CodeGraph data is stored in PostgreSQL. This file is only a presence marker.',
+          schema: schemaName,
+          note: 'CodeGraph data is stored in PostgreSQL (in the schema above). This file is only a presence marker.',
         },
         null,
         2
       )
     );
   }
-  return new PgDatabaseAdapter(resolvePgConnectionString());
+  return new PgDatabaseAdapter(resolvePgConnectionString(), schemaName);
 }

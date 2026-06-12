@@ -4,7 +4,7 @@
  * Handles SQLite database initialization and connection management.
  */
 
-import { SqliteDatabase, SqliteBackend, createDatabase } from './sqlite-adapter';
+import { SqliteDatabase, SqliteBackend, createDatabase, isPostgresBackendSelected } from './sqlite-adapter';
 import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
@@ -86,7 +86,11 @@ export class DatabaseConnection {
    * Open an existing database
    */
   static open(dbPath: string): DatabaseConnection {
-    if (!fs.existsSync(dbPath)) {
+    // The file check only applies to the SQLite backend. With PostgreSQL the
+    // local file is just a presence marker (the data lives server-side), so a
+    // fresh clone pointing at an already-indexed PG database must open fine —
+    // createPgDatabase recreates the marker.
+    if (!fs.existsSync(dbPath) && !isPostgresBackendSelected()) {
       throw new Error(`Database not found: ${dbPath}`);
     }
 
@@ -172,9 +176,26 @@ export class DatabaseConnection {
   }
 
   /**
-   * Get database file size in bytes
+   * Get database size in bytes. SQLite: the db file's size. PostgreSQL: the
+   * total relation size of this project's schema (the local file is only a
+   * ~150-byte presence marker — reporting it would show "0.00 MB" for any
+   * real index).
    */
   getSize(): number {
+    if (this.backend === 'postgres') {
+      try {
+        const row = this.db
+          .prepare(
+            'SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0) AS bytes ' +
+              'FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace ' +
+              'WHERE n.nspname = current_schema()'
+          )
+          .get() as { bytes?: number | string } | undefined;
+        return Number(row?.bytes ?? 0);
+      } catch {
+        return 0;
+      }
+    }
     const stats = fs.statSync(this.dbPath);
     return stats.size;
   }
