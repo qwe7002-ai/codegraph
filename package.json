@@ -43,6 +43,9 @@
     "tree-sitter-wasms": "^0.1.11",
     "web-tree-sitter": "^0.25.3"
   },
+  "optionalDependencies": {
+    "pg": "^8.13.0"
+  },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^20.19.30",

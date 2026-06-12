@@ -33,10 +33,11 @@ export interface SqliteDatabase {
 }
 
 /**
- * The active SQLite backend. Only one now (`node:sqlite`); kept as a named type
- * so `codegraph status` and the per-instance reporting have a stable shape.
+ * The active storage backend. `node-sqlite` is the default; `postgres` is an
+ * opt-in PostgreSQL backend (see `createDatabase`). Kept as a named type so
+ * `codegraph status` and the per-instance reporting have a stable shape.
  */
-export type SqliteBackend = 'node-sqlite';
+export type SqliteBackend = 'node-sqlite' | 'postgres';
 
 /**
  * Wraps Node's built-in `node:sqlite` (`DatabaseSync`) to match the
@@ -128,13 +129,28 @@ class NodeSqliteAdapter implements SqliteDatabase {
 }
 
 /**
- * Create a database connection backed by `node:sqlite`.
+ * Create a database connection.
+ *
+ * Default backend is `node:sqlite`. Set `CODEGRAPH_DB_BACKEND=postgres` (or
+ * `pg`) to use the opt-in PostgreSQL backend instead — configure it with
+ * `CODEGRAPH_PG_URL` / `DATABASE_URL` (or the standard `PG*` env vars). The PG
+ * backend speaks the same `SqliteDatabase` interface via on-the-fly dialect
+ * translation, so no query-site code changes are needed.
  *
  * Returns the active backend alongside the db so each `DatabaseConnection` can
  * report it per-instance — MCP can open multiple project DBs in one process, so
  * a process-global would race.
  */
 export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
+  const requested = (process.env.CODEGRAPH_DB_BACKEND ?? '').trim().toLowerCase();
+  if (requested === 'postgres' || requested === 'pg' || requested === 'postgresql') {
+    // Lazily required so the `pg` dependency and worker are only loaded when
+    // the PostgreSQL backend is actually selected.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createPgDatabase } = require('./pg-adapter');
+    return { db: createPgDatabase(dbPath), backend: 'postgres' };
+  }
+
   try {
     return { db: new NodeSqliteAdapter(dbPath), backend: 'node-sqlite' };
   } catch (error) {
